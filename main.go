@@ -1,130 +1,93 @@
 package main
 
 import (
-	"encoding/base64"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
-	"reflect"
-	"runtime"
-	"time"
+	"strings"
+	"sync"
 )
 
-type SecretHandler struct{}
-
-func (h *SecretHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	fmt.Fprintf(writer, "secret handler")
+func secretHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "POST":
+		createSecret(w, r)
+	case "GET":
+		getSecret(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 }
 
 func healthcheck(writer http.ResponseWriter, request *http.Request) {
 	fmt.Fprintf(writer, "healthcheck")
 }
 
-func log(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		name := runtime.FuncForPC(reflect.ValueOf(h).Pointer()).Name()
-		fmt.Println("Handler function called - ", name)
-		h(w, r)
-	}
-}
-
-func protect(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("Handler is protected")
-		h(w, r)
-	}
-}
-
-func body(w http.ResponseWriter, r *http.Request) {
-	len := r.ContentLength
-	body := make([]byte, len)
-	r.Body.Read(body)
-	fmt.Fprintf(w, string(body))
-}
-
-type Post struct {
-	User    string
-	Threads []string
-}
-
-func jsonExample(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	post := &Post{
-		User:    "Sau Sheong",
-		Threads: []string{"first", "second", "third"},
-	}
-	json, _ := json.Marshal(post)
-	w.Write(json)
-}
-
-func setCookie(w http.ResponseWriter, r *http.Request) {
-	c1 := http.Cookie{
-		Name:     "first_cookie",
-		Value:    "Go Web Programming",
-		HttpOnly: true,
-	}
-	c2 := http.Cookie{
-		Name:     "second_cookie",
-		Value:    "Manning Publications Co",
-		HttpOnly: true,
-	}
-	w.Header().Set("Set-Cookie", c1.String())
-	w.Header().Add("Set-Cookie", c2.String())
-}
-
-func getCookie(w http.ResponseWriter, r *http.Request) {
-	c1, err := r.Cookie("first_cookie")
-	if err != nil {
-		fmt.Fprintln(w, "Cannot get the first cookie")
-	}
-	cs := r.Cookies()
-	fmt.Fprintln(w, c1)
-	fmt.Fprintln(w, cs)
-}
-
-func setMessage(w http.ResponseWriter, r *http.Request) {
-	msg := []byte("Hello World!")
-	c := http.Cookie{
-		Name:  "flash",
-		Value: base64.URLEncoding.EncodeToString(msg),
-	}
-	http.SetCookie(w, &c)
-}
-
-func showMessage(w http.ResponseWriter, r *http.Request) {
-	c, err := r.Cookie("flash")
-	if err != nil {
-		if err == http.ErrNoCookie {
-			fmt.Fprintln(w, "No message found")
-		}
-
-	} else {
-		rc := http.Cookie{
-			Name:    "flash",
-			MaxAge:  -1,
-			Expires: time.Unix(1, 0),
-		}
-		http.SetCookie(w, &rc)
-		val, _ := base64.URLEncoding.DecodeString(c.Value)
-		fmt.Fprintln(w, string(val))
-	}
-}
-
 func main() {
-	secretHandler := SecretHandler{}
+	mux := http.NewServeMux()
 
 	server := http.Server{
-		Addr: "127.0.0.1:8080",
+		Addr:    "127.0.0.1:8080",
+		Handler: mux,
 	}
 
-	http.Handle("/secret", &secretHandler)
-	http.HandleFunc("/healthcheck", log(healthcheck))
-	http.HandleFunc("/body", body)
-	http.HandleFunc("/json", jsonExample)
-	http.HandleFunc("/set_cookie", setCookie)
-	http.HandleFunc("/get_cookie", getCookie)
-	http.HandleFunc("/set_message", setMessage)
-	http.HandleFunc("/show_message", showMessage)
+	mux.HandleFunc("/healthcheck", healthcheck)
+	mux.HandleFunc("/", secretHandler)
 
 	server.ListenAndServe()
+}
+
+var secretStore = memoryStore{Mu: sync.Mutex{}, Store: make(map[string]string)}
+
+func getHash(plainText string) string {
+	return fmt.Sprintf("%x", md5.Sum([]byte(plainText)))
+}
+
+func createSecret(w http.ResponseWriter, r *http.Request) {
+	bytes, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Error reading body", http.StatusInternalServerError)
+		return
+	}
+	p := createSecretPayload{}
+	err = json.Unmarshal(bytes, &p)
+	if err != nil || len(p.PlainText) == 0 {
+		http.Error(w, "Invalid Request", http.StatusBadRequest)
+		return
+	}
+	digest := getHash(p.PlainText)
+	resp := createSecretResponse{Id: digest}
+
+	s := secretData{Id: resp.Id, Secret: p.PlainText}
+	secretStore.Write(s)
+	jd, err := json.Marshal(&resp)
+	if err != nil {
+		panic(err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(jd)
+}
+
+type getSecretResponse struct {
+	Data string `json:"data"`
+}
+
+func getSecret(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Path
+	id = strings.TrimPrefix(id, "/")
+	resp := getSecretResponse{}
+	v := secretStore.Read(id)
+	resp.Data = v
+	jd, err := json.Marshal(&resp)
+	if err != nil {
+		panic(err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if len(resp.Data) == 0 {
+		w.WriteHeader(404)
+	}
+	w.Write(jd)
 }
